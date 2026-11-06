@@ -25,6 +25,11 @@
 //!   xMin (a converter may draw it shifted by the difference): its points are
 //!   moved so that the leftmost is at `x` again, and its recorded box and side
 //!   bearing restored, which a TrueType rasterizer places it by
+//! - `boxes`: `{composite: {"bbox": [xMin, yMin, xMax, yMax], "lsb": lsb}}`, a
+//!   composite whose recorded box differs from the one its components give (a
+//!   stale box, which a TrueType rasterizer places the glyph by): restored
+//! - `head_flags_2_4`: head flags bits 2 and 4 (instructions may depend on point
+//!   size, may alter advance width), as the release sets them
 //! - `offsets`: `{composite: [[x, y], ...]}`, the component offsets of a
 //!   composite that places a shifted glyph, or is shifted itself
 //! - `glyph_order`: the font's glyph names in order; a name the compiled font
@@ -90,6 +95,13 @@ pub struct LsbShift {
     pub bbox: [i16; 4],
 }
 
+/// A composite's recorded box and side bearing (see `boxes`).
+#[derive(Debug, Deserialize)]
+pub struct RecordedBox {
+    pub bbox: [i16; 4],
+    pub lsb: i16,
+}
+
 /// A VDMX aspect ratio range, pointing at one of the groups.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +154,10 @@ pub struct HintingFile {
     pub lsb_shifts: BTreeMap<String, LsbShift>,
     #[serde(default)]
     pub offsets: BTreeMap<String, Vec<Option<(i16, i16)>>>,
+    #[serde(default)]
+    pub boxes: BTreeMap<String, RecordedBox>,
+    #[serde(default)]
+    pub head_flags_2_4: Option<u16>,
 }
 
 impl HintingFile {
@@ -456,6 +472,49 @@ pub fn point_text(
         }
     }
     Ok(text)
+}
+
+/// A glyph's points as drawn, components placed by their transforms and offsets
+/// (point-anchored components contribute nothing), as fontTools computes a
+/// composite's box.
+fn drawn_points(glyphs: &[Glyph], gid: usize, depth: usize) -> Vec<(f64, f64)> {
+    if depth > 64 {
+        return vec![];
+    }
+    match &glyphs[gid] {
+        Glyph::Empty => vec![],
+        Glyph::Simple(simple) => simple
+            .contours
+            .iter()
+            .flat_map(|c| c.iter().map(|p| (f64::from(p.x), f64::from(p.y))))
+            .collect(),
+        Glyph::Composite(composite) => {
+            let mut out = vec![];
+            for component in composite.components() {
+                let Anchor::Offset { x: dx, y: dy } = component.anchor else {
+                    continue;
+                };
+                let t = &component.transform;
+                let (xx, yx, xy, yy) = (
+                    t.xx.to_f32() as f64,
+                    t.yx.to_f32() as f64,
+                    t.xy.to_f32() as f64,
+                    t.yy.to_f32() as f64,
+                );
+                for (x, y) in drawn_points(glyphs, component.glyph.to_u16() as usize, depth + 1) {
+                    out.push((
+                        x * xx + y * xy + f64::from(dx),
+                        x * yx + y * yy + f64::from(dy),
+                    ));
+                }
+            }
+            out
+        }
+    }
+}
+
+fn ot_round(v: f64) -> i16 {
+    (v + 0.5).floor() as i16
 }
 
 fn digest(text: &str) -> String {
@@ -878,6 +937,45 @@ pub fn apply_hinting(font_bytes: &[u8], file: &HintingFile) -> Result<Vec<u8>, G
         )));
     }
 
+    // composites' boxes from their components' points, as a compiler computes
+    // them (restorations may have moved those points); recorded boxes stay
+    let recorded: std::collections::HashSet<usize> = file
+        .boxes
+        .keys()
+        .filter_map(|n| by_name.get(n.as_str()).copied())
+        .collect();
+    for gid in 0..num_glyphs {
+        if recorded.contains(&gid) || !matches!(glyphs[gid], Glyph::Composite(_)) {
+            continue;
+        }
+        let points = drawn_points(&glyphs, gid, 0);
+        if let (Glyph::Composite(composite), false) = (&mut glyphs[gid], points.is_empty()) {
+            let fold = |f: fn(f64, f64) -> f64, init: f64, sel: fn(&(f64, f64)) -> f64| {
+                points.iter().map(sel).fold(init, f)
+            };
+            composite.bbox = write_fonts::tables::glyf::Bbox {
+                x_min: ot_round(fold(f64::min, f64::INFINITY, |p| p.0)),
+                y_min: ot_round(fold(f64::min, f64::INFINITY, |p| p.1)),
+                x_max: ot_round(fold(f64::max, f64::NEG_INFINITY, |p| p.0)),
+                y_max: ot_round(fold(f64::max, f64::NEG_INFINITY, |p| p.1)),
+            };
+        }
+    }
+    for (name, entry) in &file.boxes {
+        if let Some(&gid) = by_name.get(name.as_str())
+            && let Glyph::Composite(composite) = &mut glyphs[gid]
+        {
+            let [x_min, y_min, x_max, y_max] = entry.bbox;
+            composite.bbox = write_fonts::tables::glyf::Bbox {
+                x_min,
+                y_min,
+                x_max,
+                y_max,
+            };
+            lsbs.insert(gid, entry.lsb);
+        }
+    }
+
     let programs: HashMap<usize, &GlyphProgram> = file
         .glyphs
         .iter()
@@ -905,6 +1003,10 @@ pub fn apply_hinting(font_bytes: &[u8], file: &HintingFile) -> Result<Vec<u8>, G
     } else {
         head.flags & !write_fonts::tables::head::Flags::FORCE_INTEGER_PPEM
     };
+    if let Some(bits) = file.head_flags_2_4 {
+        let kept = head.flags.bits() & !0x14;
+        head.flags = write_fonts::tables::head::Flags::from_bits_truncate(kept | (bits & 0x14));
+    }
     let mut maxp: Maxp = font.maxp()?.to_owned_table();
     for (key, value) in &file.maxp {
         let field = match key.as_str() {
